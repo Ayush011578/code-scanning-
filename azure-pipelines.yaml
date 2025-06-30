@@ -1,0 +1,301 @@
+trigger:
+- master
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+
+- task: NodeTool@0
+  inputs:
+    versionSpec: '20.x'
+  displayName: 'Install Node.js'
+
+- script: |
+    npm install
+  displayName: 'npm install and build'
+
+- script: |
+    echo "This is a placeholder step; no changes are made."
+  displayName: 'No-op step'
+
+# Snyk Security Scan for Application Dependencies
+- task: SnykSecurityScan@1
+  inputs:
+    serviceConnectionEndpoint: 'snykoattacko'
+    testType: 'app'
+    targetFile: 'package.json'
+    monitorWhen: 'always'
+    failOnIssues: false
+    projectName: 'calculator-project/Backend'
+    organization: 'f6ff1f1e-b60e-43aa-91ab-fad13fbc3519'
+    reportFormat: 'html'
+    reportFile: '$(Build.ArtifactStagingDirectory)/snyk-app-report.html'
+  displayName: 'Run Snyk App Scan'
+  
+- task: SonarCloudPrepare@3
+  inputs:
+    SonarCloud: 'sonar-connection'
+    organization: 'demodevopsyl'
+    scannerMode: 'cli'
+    cliScannerVersion: '6.2.1.4610'
+    configMode: 'manual'
+    cliProjectKey: 'davidputra2812_CRM-Backend'
+    cliProjectName: 'CRM Backend'
+    cliSources: '.'
+
+- task: SonarCloudAnalyze@3
+
+- task: SonarCloudPublish@3
+  inputs:
+    pollingTimeoutSec: '300'
+- task: Docker@2
+  inputs:
+    containerRegistry: 'docker'
+    repository: 'crmrepo'
+    command: 'buildAndPush'
+    Dockerfile: 'Dockerfile'
+    tags: '$(Build.BuildNumber)'
+
+- task: CmdLine@2
+  displayName: Install Trivy
+  inputs:
+    script: |
+      TRIVY_VERSION=$(curl -s https://api.github.com/repos/aquasecurity/trivy/releases/latest | grep -oP '"tag_name": "\K(.*)(?=")' | sed 's/^v//')
+      wget https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz
+      tar xzf trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz
+      rm trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz
+      sudo mv trivy /usr/local/bin/
+      trivy -v
+
+- task: CmdLine@2
+  displayName: 'Run Trivy scan on image'
+  inputs:
+    script: |
+      wget https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/junit.tpl -O junit.tpl
+      trivy image application321.azurecr.io/crmrepo:$(Build.BuildNumber) --db-repository "ghcr.io/aquasecurity/trivy-db:2","public.ecr.aws/aquasecurity/trivy-db" --format template --template "@./junit.tpl" --output $(Build.ArtifactStagingDirectory)/trivy-docker-image-report.xml
+
+- task: PublishTestResults@2
+  displayName: 'Publish Trivy App Image Scan Results'
+  inputs:
+    testResultsFormat: 'JUnit'
+    testResultsFiles: '$(Build.ArtifactStagingDirectory)/trivy-docker-image-report.xml'
+    failTaskOnFailedTests: false
+
+- task: SSH@0
+  inputs:
+    sshEndpoint: 'deploy'
+    runOptions: 'commands'
+    commands: |
+      docker pull application321.azurecr.io/crmrepo:$(Build.BuildNumber)
+      docker rm -f crm_bknd
+      docker run -d --name crm_bknd -p 1711:1711 application321.azurecr.io/crmrepo:$(Build.BuildNumber)
+  condition: eq(variables['Build.Reason'], 'PullRequest')
+
+- task: HawkScanInstall@1
+  inputs:
+    version: latest
+    installerType: 'auto'
+  condition: eq(variables['Build.Reason'], 'PullRequest')
+
+- script: |
+    java -version
+  displayName: 'Check Java Version'
+
+- task: JavaToolInstaller@0
+  inputs:
+    versionSpec: '17'
+    jdkSourceOption: 'PreInstalled'
+    jdkArchitectureOption: 'x64'
+    
+- task: RunHawkScan@1
+  inputs:
+    configFile: "stackhawk.yml"
+    version: "latest"
+  env:
+    HAWK_API_KEY: $(hawk_api_key)
+  condition: eq(variables['Build.Reason'], 'PullRequest')
+
+- script: |
+    echo "Retrieving the SHA of the newly pushed image..."
+
+    # Get the SHA of the last pushed image
+    image_sha=$(docker inspect --format='{{index .RepoDigests 0}}' application321.azurecr.io/crmrepo:$(Build.BuildNumber) | cut -d'@' -f2)
+    
+    if [ -z "$image_sha" ]; then
+      echo "Error: Unable to retrieve the SHA for the image."
+      exit 1
+    fi
+
+    echo "Latest image SHA: ${image_sha}"
+
+    echo "Starting update of image tag in GitOps repository deployment.yaml"
+
+    # Clone the GitOps repository
+    git clone https://$(AccessToken)@dev.azure.com/davidputra2812/calculator-project/_git/GitOps
+    cd GitOps
+    git checkout maain
+
+    # Verify that the target deployment.yaml file exists
+    if [ ! -f crm_backend/deployment.yaml ]; then
+      echo "Error: crm_backend/deployment.yaml does not exist in the GitOps repository."
+      exit 1
+    fi
+
+    echo "Contents of deployment.yaml before update:"
+    cat crm_backend/deployment.yaml
+
+    # Update the image tag in the GitOps deployment.yaml with the latest SHA from the image
+    sed -i "s|image: application321.azurecr.io/crmrepo@.*|image: application321.azurecr.io/crmrepo@${image_sha}|" crm_backend/deployment.yaml
+
+    echo "Contents of deployment.yaml after update:"
+    cat crm_backend/deployment.yaml
+
+    echo "Updated crm_backend/deployment.yaml in GitOps repository with new image tag using SHA: ${image_sha}"
+
+    # Set up Git configuration
+    git config --global user.email "davidputra2812@gmail.com"
+    git config --global user.name "davidputra2812"
+
+
+
+    # Stage and attempt to commit changes
+    git add crm_backend/deployment.yaml
+    if git diff --cached --quiet; then
+      echo "No changes to commit in GitOps repository."
+    else
+      git commit -m "Update image tag to ${image_sha} from crm_backend"
+      echo "Changes committed in GitOps repository."
+
+      # Push the changes to the correct branch in GitOps
+      git push origin main
+    fi
+  displayName: 'Update image tag in GitOps deployment.yaml and push changes'
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+
+- script: |
+    PR_ID=$(System.PullRequest.PullRequestId)
+    REPO_NAME=$(Build.Repository.Name)
+    ORG_URL=$(System.CollectionUri)
+    BASE_URL="${ORG_URL}/$(System.TeamProject)/_git/$REPO_NAME/pullrequest/$PR_ID"
+
+    # Fetch PR details using the Azure DevOps REST API
+    PR_DETAILS=$(curl -s -u :$(System.AccessToken) \
+    "$(System.CollectionUri)$(System.TeamProject)/_apis/git/repositories/$(Build.Repository.Id)/pullRequests/$PR_ID?api-version=6.0")
+
+    PR_TITLE=$(echo $PR_DETAILS | jq -r .title)
+    PR_AUTHOR=$(echo $PR_DETAILS | jq -r .createdBy.displayName)
+
+    curl -H "Content-Type: application/json" -d '{
+      "summary": "🎉 Build Success with Reports 🎉",
+      "sections": [
+        {
+          "activityTitle": "✅ Build Successful for PR - Repository: '"$REPO_NAME"'",
+          "activitySubtitle": "🛠️ PR: '"$PR_ID"' - '"$(System.PullRequest.SourceBranch)"'",
+          "facts": [
+            {"name": "🆔 Build Number", "value": "$(Build.BuildNumber)"},
+            {"name": "🔧 Commit ID", "value": "$(Build.SourceVersion)"},
+            {"name": "👤 PR Author", "value": "'"$PR_AUTHOR"'"},
+            {"name": "📝 PR Title", "value": "'"$PR_TITLE"'"},
+            {"name": "🌿 Branch Name", "value": "$(Build.SourceBranch)"},
+            {"name": "🔗 PR Link", "value": "'"$BASE_URL"'"}
+          ],
+          "markdown": true
+        }
+      ]
+    }' $(passwebhook)
+  displayName: 'Send Teams Notification with PR Details and Reports'
+  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+
+# Notify on failure
+- script: |
+    PR_ID=$(System.PullRequest.PullRequestId)
+    REPO_NAME=$(Build.Repository.Name)
+    ORG_URL=$(System.CollectionUri)
+    BASE_URL="${ORG_URL}/$(System.TeamProject)/_git/$REPO_NAME/pullrequest/$PR_ID"
+
+    # Fetch PR details using the Azure DevOps REST API
+    PR_DETAILS=$(curl -s -u :$(System.AccessToken) \
+    "$(System.CollectionUri)$(System.TeamProject)/_apis/git/repositories/$(Build.Repository.Id)/pullRequests/$PR_ID?api-version=6.0")
+
+    PR_TITLE=$(echo $PR_DETAILS | jq -r .title)
+    PR_AUTHOR=$(echo $PR_DETAILS | jq -r .createdBy.displayName)
+
+    curl -H "Content-Type: application/json" -d '{
+      "summary": "🚨 Build Failed 🚨",
+      "sections": [
+        {
+          "activityTitle": "❌ Build Failed for PR - Repository: '"$REPO_NAME"'",
+          "activitySubtitle": "⚠️ PR: '"$PR_ID"' - '"$(System.PullRequest.SourceBranch)"'",
+          "facts": [
+            {"name": "🆔 Build Number", "value": "$(Build.BuildNumber)"},
+            {"name": "🔧 Commit ID", "value": "$(Build.SourceVersion)"},
+            {"name": "👤 PR Author", "value": "'"$PR_AUTHOR"'"},
+            {"name": "📝 PR Title", "value": "'"$PR_TITLE"'"},
+            {"name": "🌿 Branch Name", "value": "$(System.PullRequest.SourceBranch)"},
+            {"name": "🔗 PR Link", "value": "'"$BASE_URL"'"}
+          ],
+          "markdown": true
+        }
+      ]
+    }' $(passwebkhook)
+  displayName: 'Send Teams Failure Notification'
+  condition: failed()
+
+
+- script: |
+    PR_ID=$(System.PullRequest.PullRequestId)
+    REPO_NAME=$(Build.Repository.Name)
+    ORG_URL=$(System.CollectionUri)
+    BASE_URL="${ORG_URL}/$(System.TeamProject)/_git/$REPO_NAME/pullrequest/$PR_ID"
+
+    # Fetch PR details using the Azure DevOps REST API
+    PR_DETAILS=$(curl -s -u :$(System.AccessToken) \
+    "$(System.CollectionUri)$(System.TeamProject)/_apis/git/repositories/$(Build.Repository.Id)/pullRequests/$PR_ID?api-version=6.0")
+
+    PR_TITLE=$(echo $PR_DETAILS | jq -r .title)
+    PR_AUTHOR=$(echo $PR_DETAILS | jq -r .createdBy.displayName)
+
+    curl -H "Content-Type: application/json" -d '{
+      "summary": "🎉 PR Merged Successfully 🎉",
+      "sections": [
+        {
+          "activityTitle": "✅ PR Merged for Repository: '"$REPO_NAME"'",
+          "activitySubtitle": "🛠️ PR: '"$PR_ID"' - '"$(System.PullRequest.SourceBranch)"'",
+          "facts": [
+            {"name": "🆔 Build Number", "value": "$(Build.BuildNumber)"},
+            {"name": "🔧 Commit ID", "value": "$(Build.SourceVersion)"},
+            {"name": "👤 PR Author", "value": "'"$PR_AUTHOR"'"},
+            {"name": "📝 PR Title", "value": "'"$PR_TITLE"'"},
+            {"name": "🌿 Branch Name", "value": "$(System.PullRequest.SourceBranch)"},
+            {"name": "🔗 PR Link", "value": "'"$BASE_URL"'"}
+          ],
+          "markdown": true
+        }
+      ]
+    }' $(passwebhook)
+  displayName: 'Send Teams Notification on PR Merge'
+  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'), eq(variables['System.PullRequest.MergeStatus'], 'completed'))
+
+# Step to send notification on successful build (for normal builds)
+- script: |
+    REPO_NAME=$(Build.Repository.Name)
+    ORG_URL=$(System.CollectionUri)
+
+    curl -H "Content-Type: application/json" -d '{
+      "summary": "🎉 Build Completed Successfully 🎉",
+      "sections": [
+        {
+          "activityTitle": "✅ Build Successful for Repository: '"$REPO_NAME"'",
+          "activitySubtitle": "🌟 Build Number: $(Build.BuildNumber)",
+          "facts": [
+            {"name": "🔧 Commit ID", "value": "$(Build.SourceVersion)"},
+            {"name": "🌿 Branch Name", "value": "$(Build.SourceBranch)"},
+            {"name": "🔗 Build Link", "value": "'"$ORG_URL/$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)"'"}
+          ],
+          "markdown": true
+        }
+      ]
+    }' $(passwebhook)
+  displayName: 'Send Teams Notification for Normal Builds'
+  condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
